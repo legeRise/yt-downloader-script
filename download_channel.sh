@@ -12,16 +12,12 @@ CHANNEL="https://www.youtube.com/@hubbeislam9263"
 BASE_DIR="$HOME/hubb-e-islam"
 VIDEOS_DIR="$BASE_DIR/videos"
 SHORTS_DIR="$BASE_DIR/shorts"
-METADATA_DIR="$BASE_DIR/metadata"
 STATE_DIR="$BASE_DIR/.download-state"
 
 COOKIES="$HOME/cookies.txt"
-
-# Google Drive
 RCLONE_REMOTE="gdrive:hubb-e-islam"
 
 BATCH_SIZE=100
-
 YTDLP="yt-dlp"
 JS_RUNTIME="deno"
 
@@ -29,30 +25,27 @@ JS_RUNTIME="deno"
 FORMAT='bv*[height<=480][ext=mp4]+ba[ext=m4a]/bv*[height<=480]+ba/b[height<=480][ext=mp4]/b[height<=480]'
 
 # ============================================================
-# Directories
+# Directories / state
 # ============================================================
 
-mkdir -p "$VIDEOS_DIR"
-mkdir -p "$SHORTS_DIR"
-mkdir -p "$METADATA_DIR"
-mkdir -p "$STATE_DIR"
+mkdir -p "$VIDEOS_DIR" "$SHORTS_DIR" "$STATE_DIR"
 
 VIDEOS_COMPLETED="$STATE_DIR/videos_completed.txt"
 SHORTS_COMPLETED="$STATE_DIR/shorts_completed.txt"
-
 VIDEOS_FAILED="$STATE_DIR/videos_failed.txt"
 SHORTS_FAILED="$STATE_DIR/shorts_failed.txt"
-
 VIDEO_IDS="$STATE_DIR/video_ids.txt"
 SHORT_IDS="$STATE_DIR/short_ids.txt"
-
 LOCKFILE="$STATE_DIR/download.lock"
 LOG="$STATE_DIR/downloader.log"
 
-touch "$VIDEOS_COMPLETED"
-touch "$SHORTS_COMPLETED"
-touch "$VIDEOS_FAILED"
-touch "$SHORTS_FAILED"
+# Temporary stderr files are deliberately kept outside the media folders.
+COOKIE_CHECK_LOG="$STATE_DIR/cookie_check.log"
+DOWNLOAD_ERROR_LOG="$STATE_DIR/download_error.log"
+
+for file in "$VIDEOS_COMPLETED" "$SHORTS_COMPLETED" "$VIDEOS_FAILED" "$SHORTS_FAILED"; do
+    touch "$file"
+done
 
 # ============================================================
 # Prevent duplicate instances
@@ -112,7 +105,6 @@ exec > >(tee -a "$LOG") 2>&1
 
 count_lines() {
     local file="$1"
-
     if [[ -f "$file" ]]; then
         awk 'NF { n++ } END { print n+0 }' "$file"
     else
@@ -123,7 +115,6 @@ count_lines() {
 is_completed() {
     local id="$1"
     local file="$2"
-
     grep -Fxq "$id" "$file" 2>/dev/null
 }
 
@@ -151,82 +142,48 @@ mark_failed() {
     fi
 }
 
-local_usage() {
-    du -sh "$VIDEOS_DIR" "$SHORTS_DIR" 2>/dev/null |
-        awk '{sum += $1} END {print "media usage: " sum "K"}' 2>/dev/null || true
-
-    du -sh "$BASE_DIR" 2>/dev/null | awk '{print $1}'
-}
-
 free_space() {
     df -h "$BASE_DIR" | awk 'NR==2 {print $4}'
 }
 
 # ============================================================
-# Metadata
+# Cookie/authentication detection
 # ============================================================
+# yt-dlp can explicitly report that YouTube cookies are no longer valid.
+# We also catch the common authentication/bot messages so the script does
+# not silently continue for hours with a bad cookie file.
 
-fetch_metadata() {
+cookies_invalid_in_log() {
+    local log_file="$1"
 
+    grep -Eiq \
+        'provided .*cookies.*(invalid|expired|no longer valid)|cookies.*(invalid|expired|no longer valid)|sign in to confirm|login required|authentication required|confirm you.?re not a bot|http error 403|unable to access this page' \
+        "$log_file" 2>/dev/null
+}
+
+abort_for_invalid_cookies() {
     echo
-    echo "============================================================"
-    echo "UPDATING METADATA"
-    echo "============================================================"
-
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "COOKIES ARE INVALID / AUTHENTICATION FAILED"
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "YouTube rejected the current cookies.txt."
     echo
-    echo "Fetching video metadata..."
-
-    "$YTDLP" \
-        --cookies "$COOKIES" \
-        --js-runtimes "$JS_RUNTIME" \
-        --flat-playlist \
-        --ignore-errors \
-        --no-warnings \
-        --dump-single-json \
-        "$CHANNEL/videos" \
-        > "$METADATA_DIR/videos.json" 2> "$STATE_DIR/videos_metadata_errors.log"
-
-    if [[ $? -eq 0 ]]; then
-        echo "Video metadata saved:"
-        echo "$METADATA_DIR/videos.json"
-    else
-        echo "WARNING: Video metadata fetch failed."
-    fi
-
+    echo "PLEASE UPDATE YOUR COOKIES NOW:"
+    echo "  $COOKIES"
     echo
-    echo "Fetching Shorts metadata..."
+    echo "The downloader has stopped so it will NOT keep retrying"
+    echo "with invalid cookies. Replace the cookie file and run the"
+    echo "script again. Already completed videos/Shorts will still"
+    echo "be skipped automatically."
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    exit 2
+}
 
-    "$YTDLP" \
-        --cookies "$COOKIES" \
-        --js-runtimes "$JS_RUNTIME" \
-        --flat-playlist \
-        --ignore-errors \
-        --no-warnings \
-        --dump-single-json \
-        "$CHANNEL/shorts" \
-        > "$METADATA_DIR/shorts.json" 2> "$STATE_DIR/shorts_metadata_errors.log"
+check_for_cookie_failure() {
+    local log_file="$1"
 
-    if [[ $? -eq 0 ]]; then
-        echo "Shorts metadata saved:"
-        echo "$METADATA_DIR/shorts.json"
-    else
-        echo "WARNING: Shorts metadata fetch failed."
-    fi
-
-    echo
-    echo "Fetching channel metadata..."
-
-    "$YTDLP" \
-        --cookies "$COOKIES" \
-        --js-runtimes "$JS_RUNTIME" \
-        --dump-single-json \
-        "$CHANNEL" \
-        > "$METADATA_DIR/channel.json" 2> "$STATE_DIR/channel_metadata_errors.log"
-
-    if [[ $? -eq 0 ]]; then
-        echo "Channel metadata saved."
-    else
-        echo "WARNING: Channel metadata fetch failed."
+    if cookies_invalid_in_log "$log_file"; then
+        abort_for_invalid_cookies
     fi
 }
 
@@ -235,7 +192,6 @@ fetch_metadata() {
 # ============================================================
 
 fetch_inventory() {
-
     echo
     echo "============================================================"
     echo "FETCHING CHANNEL INVENTORY"
@@ -243,42 +199,40 @@ fetch_inventory() {
 
     local tmp_videos="$STATE_DIR/video_ids.tmp"
     local tmp_shorts="$STATE_DIR/short_ids.tmp"
+    local video_err="$STATE_DIR/videos_inventory_errors.log"
+    local shorts_err="$STATE_DIR/shorts_inventory_errors.log"
 
-    rm -f "$tmp_videos" "$tmp_shorts"
+    rm -f "$tmp_videos" "$tmp_shorts" "$video_err" "$shorts_err"
 
     echo
-    echo "[1/2] Fetching normal videos..."
+    echo "[1/2] Fetching normal video IDs..."
 
     "$YTDLP" \
         --cookies "$COOKIES" \
         --js-runtimes "$JS_RUNTIME" \
         --flat-playlist \
         --ignore-errors \
-        --no-warnings \
         --print "%(id)s" \
         "$CHANNEL/videos" \
-        > "$tmp_videos"
+        > "$tmp_videos" 2> "$video_err"
 
-    if [[ $? -ne 0 ]]; then
-        echo "WARNING: Video inventory command returned an error."
-    fi
+    cat "$video_err" || true
+    check_for_cookie_failure "$video_err"
 
     echo
-    echo "[2/2] Fetching Shorts..."
+    echo "[2/2] Fetching Shorts IDs..."
 
     "$YTDLP" \
         --cookies "$COOKIES" \
         --js-runtimes "$JS_RUNTIME" \
         --flat-playlist \
         --ignore-errors \
-        --no-warnings \
         --print "%(id)s" \
         "$CHANNEL/shorts" \
-        > "$tmp_shorts"
+        > "$tmp_shorts" 2> "$shorts_err"
 
-    if [[ $? -ne 0 ]]; then
-        echo "WARNING: Shorts inventory command returned an error."
-    fi
+    cat "$shorts_err" || true
+    check_for_cookie_failure "$shorts_err"
 
     # Remove blanks and duplicate IDs.
     sort -u "$tmp_videos" | grep -E '^[A-Za-z0-9_-]{11}$' > "$VIDEO_IDS" || true
@@ -286,16 +240,10 @@ fetch_inventory() {
 
     rm -f "$tmp_videos" "$tmp_shorts"
 
-    local videos
-    local shorts
-    local vc
-    local sc
-
-    videos="$(count_lines "$VIDEO_IDS")"
-    shorts="$(count_lines "$SHORT_IDS")"
-
-    vc="$(count_lines "$VIDEOS_COMPLETED")"
-    sc="$(count_lines "$SHORTS_COMPLETED")"
+    local videos="$(count_lines "$VIDEO_IDS")"
+    local shorts="$(count_lines "$SHORT_IDS")"
+    local vc="$(count_lines "$VIDEOS_COMPLETED")"
+    local sc="$(count_lines "$SHORTS_COMPLETED")"
 
     echo
     echo "============================================================"
@@ -315,24 +263,21 @@ fetch_inventory() {
 }
 
 # ============================================================
-# Download one video
+# Download one video / Short
 # ============================================================
 
 download_one() {
-
     local id="$1"
     local type="$2"
     local output_dir="$3"
     local completed_file="$4"
     local failed_file="$5"
-
     local url="https://www.youtube.com/watch?v=$id"
 
     if is_completed "$id" "$completed_file"; then
         return 0
     fi
 
-    echo
     echo
     echo "############################################################"
     echo "DOWNLOADING $type"
@@ -342,6 +287,8 @@ download_one() {
     echo "Free:     $(free_space)"
     echo "############################################################"
     echo
+
+    rm -f "$DOWNLOAD_ERROR_LOG"
 
     if "$YTDLP" \
         --cookies "$COOKIES" \
@@ -359,8 +306,9 @@ download_one() {
         --format "$FORMAT" \
         --merge-output-format mp4 \
         --output "$output_dir/%(title)s [%(id)s].%(ext)s" \
-        "$url"
+        "$url" 2> >(tee "$DOWNLOAD_ERROR_LOG" >&2)
     then
+        check_for_cookie_failure "$DOWNLOAD_ERROR_LOG"
 
         echo
         echo "------------------------------------------------------------"
@@ -371,10 +319,9 @@ download_one() {
         echo "------------------------------------------------------------"
 
         mark_completed "$id" "$completed_file" "$failed_file"
-
         return 0
-
     else
+        check_for_cookie_failure "$DOWNLOAD_ERROR_LOG"
 
         echo
         echo "------------------------------------------------------------"
@@ -384,7 +331,6 @@ download_one() {
         echo "------------------------------------------------------------"
 
         mark_failed "$id" "$failed_file"
-
         return 1
     fi
 }
@@ -392,9 +338,10 @@ download_one() {
 # ============================================================
 # Rclone checkpoint
 # ============================================================
+# No metadata is uploaded anymore. Only the actual video/Short files
+# are copied to Google Drive.
 
 sync_checkpoint() {
-
     echo
     echo "============================================================"
     echo "RCLONE CHECKPOINT"
@@ -403,7 +350,7 @@ sync_checkpoint() {
     echo "Local usage: $(du -sh "$BASE_DIR" 2>/dev/null | awk '{print $1}')"
     echo "Free space:  $(free_space)"
     echo
-    echo "Uploading archive..."
+    echo "Uploading archive media..."
     echo
 
     if rclone copy \
@@ -440,42 +387,17 @@ sync_checkpoint() {
         return 1
     fi
 
-    if rclone copy \
-        "$METADATA_DIR" \
-        "$RCLONE_REMOTE/metadata" \
-        --progress \
-        --stats=30s \
-        --transfers=2 \
-        --checkers=4 \
-        --retries=5 \
-        --low-level-retries=10
-    then
-        echo "Metadata upload completed."
-    else
-        echo "ERROR: Metadata upload failed."
-        echo "LOCAL MEDIA WILL NOT BE DELETED."
-        return 1
-    fi
-
     echo
     echo "Verifying remote files..."
 
-    if rclone check \
-        "$VIDEOS_DIR" \
-        "$RCLONE_REMOTE/videos" \
-        --one-way
-    then
+    if rclone check "$VIDEOS_DIR" "$RCLONE_REMOTE/videos" --one-way; then
         echo "Videos verification OK."
     else
         echo "ERROR: Videos verification failed."
         return 1
     fi
 
-    if rclone check \
-        "$SHORTS_DIR" \
-        "$RCLONE_REMOTE/shorts" \
-        --one-way
-    then
+    if rclone check "$SHORTS_DIR" "$RCLONE_REMOTE/shorts" --one-way; then
         echo "Shorts verification OK."
     else
         echo "ERROR: Shorts verification failed."
@@ -497,10 +419,7 @@ sync_checkpoint() {
         \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.m4a' \) \
         -delete
 
-    find "$VIDEOS_DIR" "$SHORTS_DIR" \
-        -type d \
-        -empty \
-        -delete 2>/dev/null || true
+    find "$VIDEOS_DIR" "$SHORTS_DIR" -type d -empty -delete 2>/dev/null || true
 
     echo
     echo "Local media cleaned."
@@ -513,9 +432,7 @@ sync_checkpoint() {
 # ============================================================
 
 on_exit() {
-
     local code=$?
-
     echo
     echo "============================================================"
     echo "ARCHIVE PROCESS STOPPED"
@@ -539,12 +456,11 @@ echo "Channel:        $CHANNEL"
 echo
 echo "Videos:         $VIDEOS_DIR"
 echo "Shorts:         $SHORTS_DIR"
-echo "Metadata:       $METADATA_DIR"
-echo
 echo "Google Drive:   $RCLONE_REMOTE"
 echo "Batch size:     $BATCH_SIZE"
 echo "Format:         <= 480p"
 echo "JS runtime:     $JS_RUNTIME"
+echo "Metadata:       DISABLED"
 echo "============================================================"
 echo
 
@@ -556,7 +472,6 @@ fetch_inventory
 
 TOTAL_VIDEOS="$(count_lines "$VIDEO_IDS")"
 TOTAL_SHORTS="$(count_lines "$SHORT_IDS")"
-
 DONE_VIDEOS="$(count_lines "$VIDEOS_COMPLETED")"
 DONE_SHORTS="$(count_lines "$SHORTS_COMPLETED")"
 
@@ -564,13 +479,8 @@ echo
 echo "Starting archive:"
 echo "  Videos remaining: $((TOTAL_VIDEOS - DONE_VIDEOS))"
 echo "  Shorts remaining: $((TOTAL_SHORTS - DONE_SHORTS))"
+echo "  Metadata downloads: DISABLED"
 echo
-
-# ============================================================
-# Metadata
-# ============================================================
-
-fetch_metadata
 
 # ============================================================
 # Download videos
@@ -585,9 +495,7 @@ echo "DOWNLOADING NORMAL VIDEOS"
 echo "============================================================"
 
 while IFS= read -r id; do
-
     [[ -z "$id" ]] && continue
-
     CURRENT=$((CURRENT + 1))
 
     if is_completed "$id" "$VIDEOS_COMPLETED"; then
@@ -609,7 +517,6 @@ while IFS= read -r id; do
         BATCH_COUNTER=0
         sync_checkpoint
     fi
-
 done < "$VIDEO_IDS"
 
 # ============================================================
@@ -624,9 +531,7 @@ echo "DOWNLOADING SHORTS"
 echo "============================================================"
 
 while IFS= read -r id; do
-
     [[ -z "$id" ]] && continue
-
     CURRENT=$((CURRENT + 1))
 
     if is_completed "$id" "$SHORTS_COMPLETED"; then
@@ -648,7 +553,6 @@ while IFS= read -r id; do
         BATCH_COUNTER=0
         sync_checkpoint
     fi
-
 done < "$SHORT_IDS"
 
 # ============================================================
@@ -657,7 +561,6 @@ done < "$SHORT_IDS"
 
 DONE_VIDEOS="$(count_lines "$VIDEOS_COMPLETED")"
 DONE_SHORTS="$(count_lines "$SHORTS_COMPLETED")"
-
 FAILED_VIDEOS="$(count_lines "$VIDEOS_FAILED")"
 FAILED_SHORTS="$(count_lines "$SHORTS_FAILED")"
 
