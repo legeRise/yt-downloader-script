@@ -21,12 +21,7 @@ BATCH_SIZE=100
 YTDLP="yt-dlp"
 JS_RUNTIME="deno"
 
-# Maximum 480p.
 FORMAT='bv*[height<=480][ext=mp4]+ba[ext=m4a]/bv*[height<=480]+ba/b[height<=480][ext=mp4]/b[height<=480]'
-
-# ============================================================
-# Directories / state
-# ============================================================
 
 mkdir -p "$VIDEOS_DIR" "$SHORTS_DIR" "$STATE_DIR"
 
@@ -38,8 +33,6 @@ VIDEO_IDS="$STATE_DIR/video_ids.txt"
 SHORT_IDS="$STATE_DIR/short_ids.txt"
 LOCKFILE="$STATE_DIR/download.lock"
 LOG="$STATE_DIR/downloader.log"
-
-# Temporary stderr files are deliberately kept outside the media folders.
 COOKIE_CHECK_LOG="$STATE_DIR/cookie_check.log"
 DOWNLOAD_ERROR_LOG="$STATE_DIR/download_error.log"
 
@@ -47,86 +40,37 @@ for file in "$VIDEOS_COMPLETED" "$SHORTS_COMPLETED" "$VIDEOS_FAILED" "$SHORTS_FA
     touch "$file"
 done
 
-# ============================================================
-# Prevent duplicate instances
-# ============================================================
-
 exec 9>"$LOCKFILE"
-
 if ! flock -n 9; then
     echo "ERROR: Another archive downloader is already running."
     exit 1
 fi
-
-# ============================================================
-# Checks
-# ============================================================
 
 if [[ ! -f "$COOKIES" ]]; then
     echo "ERROR: Cookies not found:"
     echo "$COOKIES"
     exit 1
 fi
-
-if ! command -v "$YTDLP" >/dev/null 2>&1; then
-    echo "ERROR: yt-dlp not found."
-    exit 1
-fi
-
-if ! command -v "$JS_RUNTIME" >/dev/null 2>&1; then
-    echo "ERROR: Deno not found."
-    echo
-    echo "Install with:"
-    echo "uv tool install deno"
-    exit 1
-fi
-
-if ! command -v rclone >/dev/null 2>&1; then
-    echo "ERROR: rclone not found."
-    exit 1
-fi
-
-if ! command -v ffmpeg >/dev/null 2>&1; then
-    echo "ERROR: ffmpeg not found."
-    exit 1
-fi
-
+if ! command -v "$YTDLP" >/dev/null 2>&1; then echo "ERROR: yt-dlp not found."; exit 1; fi
+if ! command -v "$JS_RUNTIME" >/dev/null 2>&1; then echo "ERROR: Deno not found."; exit 1; fi
+if ! command -v rclone >/dev/null 2>&1; then echo "ERROR: rclone not found."; exit 1; fi
+if ! command -v ffmpeg >/dev/null 2>&1; then echo "ERROR: ffmpeg not found."; exit 1; fi
 chmod 600 "$COOKIES"
-
-# ============================================================
-# Logging
-# ============================================================
-
 exec > >(tee -a "$LOG") 2>&1
-
-# ============================================================
-# Helpers
-# ============================================================
 
 count_lines() {
     local file="$1"
-    if [[ -f "$file" ]]; then
-        awk 'NF { n++ } END { print n+0 }' "$file"
-    else
-        echo "0"
-    fi
+    if [[ -f "$file" ]]; then awk 'NF { n++ } END { print n+0 }' "$file"; else echo "0"; fi
 }
 
 is_completed() {
-    local id="$1"
-    local file="$2"
+    local id="$1" file="$2"
     grep -Fxq "$id" "$file" 2>/dev/null
 }
 
 mark_completed() {
-    local id="$1"
-    local completed_file="$2"
-    local failed_file="$3"
-
-    if ! is_completed "$id" "$completed_file"; then
-        printf '%s\n' "$id" >> "$completed_file"
-    fi
-
+    local id="$1" completed_file="$2" failed_file="$3"
+    if ! is_completed "$id" "$completed_file"; then printf '%s\n' "$id" >> "$completed_file"; fi
     if grep -Fxq "$id" "$failed_file" 2>/dev/null; then
         grep -Fxv "$id" "$failed_file" > "${failed_file}.tmp" || true
         mv "${failed_file}.tmp" "$failed_file"
@@ -134,28 +78,46 @@ mark_completed() {
 }
 
 mark_failed() {
-    local id="$1"
-    local failed_file="$2"
-
-    if ! grep -Fxq "$id" "$failed_file" 2>/dev/null; then
-        printf '%s\n' "$id" >> "$failed_file"
-    fi
+    local id="$1" failed_file="$2"
+    if ! grep -Fxq "$id" "$failed_file" 2>/dev/null; then printf '%s\n' "$id" >> "$failed_file"; fi
 }
 
-free_space() {
-    df -h "$BASE_DIR" | awk 'NR==2 {print $4}'
+free_space() { df -h "$BASE_DIR" | awk 'NR==2 {print $4}'; }
+
+# ============================================================
+# Existing-file reconciliation
+# ============================================================
+# If a previous run downloaded the media successfully but was stopped
+# before writing its ID to the state file, recognize the local file now.
+# This avoids another YouTube request and repairs persistent state.
+
+is_media_present() {
+    local id="$1" dir="$2"
+    find "$dir" -maxdepth 1 -type f \
+        \( -iname "*[$id].mp4" -o -iname "*[$id].mkv" -o -iname "*[$id].webm" -o -iname "*[$id].m4a" \) \
+        -print -quit 2>/dev/null | grep -q .
+}
+
+reconcile_existing_media() {
+    local id="$1" dir="$2" completed_file="$3" failed_file="$4" type="$5"
+
+    if is_completed "$id" "$completed_file"; then return 0; fi
+
+    if is_media_present "$id" "$dir"; then
+        echo "SKIP $type $id — file already exists; recording as completed"
+        mark_completed "$id" "$completed_file" "$failed_file"
+        return 0
+    fi
+
+    return 1
 }
 
 # ============================================================
 # Cookie/authentication detection
 # ============================================================
-# yt-dlp can explicitly report that YouTube cookies are no longer valid.
-# We also catch the common authentication/bot messages so the script does
-# not silently continue for hours with a bad cookie file.
 
 cookies_invalid_in_log() {
     local log_file="$1"
-
     grep -Eiq \
         'provided .*cookies.*(invalid|expired|no longer valid)|cookies.*(invalid|expired|no longer valid)|sign in to confirm|login required|authentication required|confirm you.?re not a bot|http error 403|unable to access this page' \
         "$log_file" 2>/dev/null
@@ -181,10 +143,7 @@ abort_for_invalid_cookies() {
 
 check_for_cookie_failure() {
     local log_file="$1"
-
-    if cookies_invalid_in_log "$log_file"; then
-        abort_for_invalid_cookies
-    fi
+    if cookies_invalid_in_log "$log_file"; then abort_for_invalid_cookies; fi
 }
 
 # ============================================================
@@ -201,43 +160,20 @@ fetch_inventory() {
     local tmp_shorts="$STATE_DIR/short_ids.tmp"
     local video_err="$STATE_DIR/videos_inventory_errors.log"
     local shorts_err="$STATE_DIR/shorts_inventory_errors.log"
-
     rm -f "$tmp_videos" "$tmp_shorts" "$video_err" "$shorts_err"
 
-    echo
     echo "[1/2] Fetching normal video IDs..."
-
-    "$YTDLP" \
-        --cookies "$COOKIES" \
-        --js-runtimes "$JS_RUNTIME" \
-        --flat-playlist \
-        --ignore-errors \
-        --print "%(id)s" \
-        "$CHANNEL/videos" \
-        > "$tmp_videos" 2> "$video_err"
-
+    "$YTDLP" --cookies "$COOKIES" --js-runtimes "$JS_RUNTIME" --flat-playlist --ignore-errors --print "%(id)s" "$CHANNEL/videos" > "$tmp_videos" 2> "$video_err"
     cat "$video_err" || true
     check_for_cookie_failure "$video_err"
 
-    echo
     echo "[2/2] Fetching Shorts IDs..."
-
-    "$YTDLP" \
-        --cookies "$COOKIES" \
-        --js-runtimes "$JS_RUNTIME" \
-        --flat-playlist \
-        --ignore-errors \
-        --print "%(id)s" \
-        "$CHANNEL/shorts" \
-        > "$tmp_shorts" 2> "$shorts_err"
-
+    "$YTDLP" --cookies "$COOKIES" --js-runtimes "$JS_RUNTIME" --flat-playlist --ignore-errors --print "%(id)s" "$CHANNEL/shorts" > "$tmp_shorts" 2> "$shorts_err"
     cat "$shorts_err" || true
     check_for_cookie_failure "$shorts_err"
 
-    # Remove blanks and duplicate IDs.
     sort -u "$tmp_videos" | grep -E '^[A-Za-z0-9_-]{11}$' > "$VIDEO_IDS" || true
     sort -u "$tmp_shorts" | grep -E '^[A-Za-z0-9_-]{11}$' > "$SHORT_IDS" || true
-
     rm -f "$tmp_videos" "$tmp_shorts"
 
     local videos="$(count_lines "$VIDEO_IDS")"
@@ -245,17 +181,14 @@ fetch_inventory() {
     local vc="$(count_lines "$VIDEOS_COMPLETED")"
     local sc="$(count_lines "$SHORTS_COMPLETED")"
 
-    echo
     echo "============================================================"
     echo "CHANNEL INVENTORY"
     echo "============================================================"
     echo "Videos found:       $videos"
     echo "Shorts found:       $shorts"
     echo "Total:              $((videos + shorts))"
-    echo
     echo "Videos completed:   $vc"
     echo "Shorts completed:   $sc"
-    echo
     echo "Videos remaining:   $((videos - vc))"
     echo "Shorts remaining:   $((shorts - sc))"
     echo "Total remaining:    $((videos + shorts - vc - sc))"
@@ -267,16 +200,10 @@ fetch_inventory() {
 # ============================================================
 
 download_one() {
-    local id="$1"
-    local type="$2"
-    local output_dir="$3"
-    local completed_file="$4"
-    local failed_file="$5"
+    local id="$1" type="$2" output_dir="$3" completed_file="$4" failed_file="$5"
     local url="https://www.youtube.com/watch?v=$id"
 
-    if is_completed "$id" "$completed_file"; then
-        return 0
-    fi
+    if is_completed "$id" "$completed_file"; then return 0; fi
 
     echo
     echo "############################################################"
@@ -309,27 +236,17 @@ download_one() {
         "$url" 2> >(tee "$DOWNLOAD_ERROR_LOG" >&2)
     then
         check_for_cookie_failure "$DOWNLOAD_ERROR_LOG"
-
-        echo
-        echo "------------------------------------------------------------"
         echo "SUCCESS: $type"
         echo "ID: $id"
         echo "Finished: $(date)"
         echo "Free space: $(free_space)"
-        echo "------------------------------------------------------------"
-
         mark_completed "$id" "$completed_file" "$failed_file"
         return 0
     else
         check_for_cookie_failure "$DOWNLOAD_ERROR_LOG"
-
-        echo
-        echo "------------------------------------------------------------"
         echo "FAILED: $type"
         echo "ID: $id"
         echo "Time: $(date)"
-        echo "------------------------------------------------------------"
-
         mark_failed "$id" "$failed_file"
         return 1
     fi
@@ -338,98 +255,31 @@ download_one() {
 # ============================================================
 # Rclone checkpoint
 # ============================================================
-# No metadata is uploaded anymore. Only the actual video/Short files
-# are copied to Google Drive.
 
 sync_checkpoint() {
     echo
     echo "============================================================"
     echo "RCLONE CHECKPOINT"
     echo "============================================================"
-    echo "Remote: $RCLONE_REMOTE"
-    echo "Local usage: $(du -sh "$BASE_DIR" 2>/dev/null | awk '{print $1}')"
-    echo "Free space:  $(free_space)"
-    echo
-    echo "Uploading archive media..."
-    echo
 
-    if rclone copy \
-        "$VIDEOS_DIR" \
-        "$RCLONE_REMOTE/videos" \
-        --progress \
-        --stats=30s \
-        --transfers=4 \
-        --checkers=8 \
-        --retries=5 \
-        --low-level-retries=10
-    then
-        echo "Videos upload completed."
-    else
-        echo "ERROR: Videos upload failed."
-        echo "LOCAL FILES WILL NOT BE DELETED."
+    if ! rclone copy "$VIDEOS_DIR" "$RCLONE_REMOTE/videos" --progress --stats=30s --transfers=4 --checkers=8 --retries=5 --low-level-retries=10; then
+        echo "ERROR: Videos upload failed. LOCAL FILES WILL NOT BE DELETED."
         return 1
     fi
 
-    if rclone copy \
-        "$SHORTS_DIR" \
-        "$RCLONE_REMOTE/shorts" \
-        --progress \
-        --stats=30s \
-        --transfers=4 \
-        --checkers=8 \
-        --retries=5 \
-        --low-level-retries=10
-    then
-        echo "Shorts upload completed."
-    else
-        echo "ERROR: Shorts upload failed."
-        echo "LOCAL FILES WILL NOT BE DELETED."
+    if ! rclone copy "$SHORTS_DIR" "$RCLONE_REMOTE/shorts" --progress --stats=30s --transfers=4 --checkers=8 --retries=5 --low-level-retries=10; then
+        echo "ERROR: Shorts upload failed. LOCAL FILES WILL NOT BE DELETED."
         return 1
     fi
 
-    echo
-    echo "Verifying remote files..."
+    if ! rclone check "$VIDEOS_DIR" "$RCLONE_REMOTE/videos" --one-way; then echo "ERROR: Videos verification failed."; return 1; fi
+    if ! rclone check "$SHORTS_DIR" "$RCLONE_REMOTE/shorts" --one-way; then echo "ERROR: Shorts verification failed."; return 1; fi
 
-    if rclone check "$VIDEOS_DIR" "$RCLONE_REMOTE/videos" --one-way; then
-        echo "Videos verification OK."
-    else
-        echo "ERROR: Videos verification failed."
-        return 1
-    fi
-
-    if rclone check "$SHORTS_DIR" "$RCLONE_REMOTE/shorts" --one-way; then
-        echo "Shorts verification OK."
-    else
-        echo "ERROR: Shorts verification failed."
-        return 1
-    fi
-
-    echo
-    echo "Remote verification successful."
-    echo
-    echo "Removing local downloaded media..."
-
-    find "$VIDEOS_DIR" \
-        -type f \
-        \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.m4a' \) \
-        -delete
-
-    find "$SHORTS_DIR" \
-        -type f \
-        \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.m4a' \) \
-        -delete
-
+    find "$VIDEOS_DIR" -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.m4a' \) -delete
+    find "$SHORTS_DIR" -type f \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.webm' -o -iname '*.m4a' \) -delete
     find "$VIDEOS_DIR" "$SHORTS_DIR" -type d -empty -delete 2>/dev/null || true
-
-    echo
-    echo "Local media cleaned."
-    echo "Free space now: $(free_space)"
-    echo "============================================================"
+    echo "Remote verification successful; local media cleaned."
 }
-
-# ============================================================
-# Trap
-# ============================================================
 
 on_exit() {
     local code=$?
@@ -440,12 +290,7 @@ on_exit() {
     echo "Exit code: $code"
     echo "============================================================"
 }
-
 trap on_exit EXIT
-
-# ============================================================
-# Header
-# ============================================================
 
 echo
 echo "============================================================"
@@ -453,7 +298,6 @@ echo "        HUBB-E-ISLAM YOUTUBE ARCHIVE"
 echo "============================================================"
 echo "Started:        $(date)"
 echo "Channel:        $CHANNEL"
-echo
 echo "Videos:         $VIDEOS_DIR"
 echo "Shorts:         $SHORTS_DIR"
 echo "Google Drive:   $RCLONE_REMOTE"
@@ -462,38 +306,24 @@ echo "Format:         <= 480p"
 echo "JS runtime:     $JS_RUNTIME"
 echo "Metadata:       DISABLED"
 echo "============================================================"
-echo
-
-# ============================================================
-# Inventory
-# ============================================================
 
 fetch_inventory
-
 TOTAL_VIDEOS="$(count_lines "$VIDEO_IDS")"
 TOTAL_SHORTS="$(count_lines "$SHORT_IDS")"
 DONE_VIDEOS="$(count_lines "$VIDEOS_COMPLETED")"
 DONE_SHORTS="$(count_lines "$SHORTS_COMPLETED")"
 
-echo
 echo "Starting archive:"
 echo "  Videos remaining: $((TOTAL_VIDEOS - DONE_VIDEOS))"
 echo "  Shorts remaining: $((TOTAL_SHORTS - DONE_SHORTS))"
 echo "  Metadata downloads: DISABLED"
 echo
 
-# ============================================================
-# Download videos
-# ============================================================
-
 BATCH_COUNTER=0
 CURRENT=0
-
-echo
 echo "============================================================"
 echo "DOWNLOADING NORMAL VIDEOS"
 echo "============================================================"
-
 while IFS= read -r id; do
     [[ -z "$id" ]] && continue
     CURRENT=$((CURRENT + 1))
@@ -503,13 +333,12 @@ while IFS= read -r id; do
         continue
     fi
 
-    if download_one \
-        "$id" \
-        "VIDEO [$CURRENT/$TOTAL_VIDEOS]" \
-        "$VIDEOS_DIR" \
-        "$VIDEOS_COMPLETED" \
-        "$VIDEOS_FAILED"
-    then
+    # NEW: recognize an already-downloaded local file without contacting YouTube.
+    if reconcile_existing_media "$id" "$VIDEOS_DIR" "$VIDEOS_COMPLETED" "$VIDEOS_FAILED" "video"; then
+        continue
+    fi
+
+    if download_one "$id" "VIDEO [$CURRENT/$TOTAL_VIDEOS]" "$VIDEOS_DIR" "$VIDEOS_COMPLETED" "$VIDEOS_FAILED"; then
         BATCH_COUNTER=$((BATCH_COUNTER + 1))
     fi
 
@@ -519,17 +348,11 @@ while IFS= read -r id; do
     fi
 done < "$VIDEO_IDS"
 
-# ============================================================
-# Download Shorts
-# ============================================================
-
+BATCH_COUNTER=0
 CURRENT=0
-
-echo
 echo "============================================================"
 echo "DOWNLOADING SHORTS"
 echo "============================================================"
-
 while IFS= read -r id; do
     [[ -z "$id" ]] && continue
     CURRENT=$((CURRENT + 1))
@@ -539,13 +362,12 @@ while IFS= read -r id; do
         continue
     fi
 
-    if download_one \
-        "$id" \
-        "SHORT [$CURRENT/$TOTAL_SHORTS]" \
-        "$SHORTS_DIR" \
-        "$SHORTS_COMPLETED" \
-        "$SHORTS_FAILED"
-    then
+    # NEW: recognize an already-downloaded local file without contacting YouTube.
+    if reconcile_existing_media "$id" "$SHORTS_DIR" "$SHORTS_COMPLETED" "$SHORTS_FAILED" "Short"; then
+        continue
+    fi
+
+    if download_one "$id" "SHORT [$CURRENT/$TOTAL_SHORTS]" "$SHORTS_DIR" "$SHORTS_COMPLETED" "$SHORTS_FAILED"; then
         BATCH_COUNTER=$((BATCH_COUNTER + 1))
     fi
 
@@ -554,10 +376,6 @@ while IFS= read -r id; do
         sync_checkpoint
     fi
 done < "$SHORT_IDS"
-
-# ============================================================
-# Final summary
-# ============================================================
 
 DONE_VIDEOS="$(count_lines "$VIDEOS_COMPLETED")"
 DONE_SHORTS="$(count_lines "$SHORTS_COMPLETED")"
@@ -572,20 +390,14 @@ echo "Videos:"
 echo "  Found:       $TOTAL_VIDEOS"
 echo "  Completed:   $DONE_VIDEOS"
 echo "  Failed:      $FAILED_VIDEOS"
-echo
 echo "Shorts:"
 echo "  Found:       $TOTAL_SHORTS"
 echo "  Completed:   $DONE_SHORTS"
 echo "  Failed:      $FAILED_SHORTS"
-echo
 echo "Total completed: $((DONE_VIDEOS + DONE_SHORTS))"
 echo "Total failed:    $((FAILED_VIDEOS + FAILED_SHORTS))"
 echo "Free space:      $(free_space)"
 echo "============================================================"
-
-# ============================================================
-# Final upload
-# ============================================================
 
 sync_checkpoint
 
